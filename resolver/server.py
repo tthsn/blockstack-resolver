@@ -12,6 +12,7 @@ import json
 import collections
 import pylibmc
 import logging
+import xmlrpclib
 
 from flask import Flask, make_response, jsonify, abort, request
 from time import time
@@ -19,7 +20,12 @@ from basicrpc import Proxy
 
 from blockstack_proofs import profile_to_proofs, profile_v3_to_proofs
 from blockstack_profiles import resolve_zone_file_to_profile
-from blockstack_profiles import is_profile_in_legacy_format
+from blockstack_profiles import get_token_file_url_from_zone_file
+from blockstack_profiles import get_profile_from_tokens
+#from blockstack_profiles import is_profile_in_legacy_format
+from blockstack_zones import parse_zone_file
+
+from blockstack_client.proxy import get_name_blockchain_record
 
 from .crossdomain import crossdomain
 
@@ -125,6 +131,109 @@ def fetch_proofs(profile, username, profile_ver=2, refresh=False):
     return proofs
 
 
+def is_profile_in_legacy_format(profile):
+    """
+    Is a given profile JSON object in legacy format?
+    """
+    if isinstance(profile, dict):
+        pass
+    elif isinstance(profile, (str, unicode)):
+        try:
+            profile = json.loads(profile)
+        except ValueError:
+            return False
+    else:
+        return False
+
+    if "@type" in profile:
+        return False
+
+    if "@context" in profile:
+        return False
+
+    is_in_legacy_format = False
+
+    if "avatar" in profile:
+        is_in_legacy_format = True
+    elif "cover" in profile:
+        is_in_legacy_format = True
+    elif "bio" in profile:
+        is_in_legacy_format = True
+    elif "twitter" in profile:
+        is_in_legacy_format = True
+    elif "facebook" in profile:
+        is_in_legacy_format = True
+
+    return is_in_legacy_format
+
+
+def parse_uri_from_zone_file(zone_file):
+
+    token_file_url = None
+    zone_file = dict(parse_zone_file(zone_file))
+
+    if isinstance(zone_file["uri"], list) and len(zone_file["uri"]) > 0:
+
+        index = 0
+        while(index < len(zone_file["uri"])):
+
+            record = zone_file["uri"][index]
+
+            if 'name' in record and record['name'] == '_http._tcp':
+                first_uri_record = zone_file["uri"][index]
+                token_file_url = first_uri_record["target"]
+                break
+
+            index += 1
+
+    return token_file_url
+
+
+def resolve_zone_file_from_rpc(zone_file, owner_address):
+
+    rpc_uri = parse_uri_from_zone_file(zone_file)
+
+    uri, fqu = rpc_uri.rsplit('#')
+
+    try:
+        s = xmlrpclib.ServerProxy(uri, allow_none=True)
+        data = s.get_profile(fqu)
+    except Exception as e:
+        print e
+
+    data = json.loads(data)
+    profile = json.loads(data['profile'])
+    pubkey = profile[0]['parentPublicKey']
+
+    try:
+        profile = get_profile_from_tokens(profile, pubkey)
+    except Exception as e:
+        print e
+
+    return profile
+
+
+def resolve_zone_file_to_profile(zone_file, address_or_public_key):
+
+    profile = None
+
+    if is_profile_in_legacy_format(zone_file):
+        return zone_file
+
+    try:
+        token_file_url = get_token_file_url_from_zone_file(zone_file)
+
+        r = requests.get(token_file_url)
+
+        profile_token_records = json.loads(r.text)
+
+        profile = get_profile_from_tokens(profile_token_records, address_or_public_key)
+    except Exception as e:
+        profile = resolve_zone_file_from_rpc(zone_file, address_or_public_key)
+
+    return profile, None
+
+
 def format_profile(profile, username, address, refresh=False):
     """ Process profile data and
         1) Insert verifications
@@ -138,43 +247,48 @@ def format_profile(profile, username, address, refresh=False):
         data['profile'] = {}
         data['error'] = profile['error']
         data['verifications'] = []
+        data['owner_address'] = address
         data['zone_file'] = zone_file
 
         return data
 
     try:
-        profile = resolve_zone_file_to_profile(profile, address)
-
+        profile, error = resolve_zone_file_to_profile(profile, address)
     except:
         if 'message' in profile:
             data['profile'] = json.loads(profile)
             data['verifications'] = []
+            data['owner_address'] = address
             data['zone_file'] = zone_file
             return data
 
     if profile is None:
         data['profile'] = {}
-        data['error'] = "Malformed profile data."
+
+        if error is not None:
+            data['error'] = error
+        else:
+            data['error'] = "Malformed profile data."
         data['verifications'] = []
 
     else:
-        profile_in_legacy_format = False
 
-        try:
-            profile_in_legacy_format = is_profile_in_legacy_format(profile)
-        except:
-            pass
+        profile_in_legacy_format = is_profile_in_legacy_format(profile)
 
         if not profile_in_legacy_format:
             data['profile'] = profile
             data['verifications'] = fetch_proofs(data['profile'], username,
                                                  profile_ver=3, refresh=refresh)
         else:
-            data['profile'] = json.loads(profile)
+            if type(profile) is not dict:
+                data['profile'] = json.loads(profile)
+            else:
+                data['profile'] = profile
             data['verifications'] = fetch_proofs(data['profile'], username,
                                                  refresh=refresh)
 
     data['zone_file'] = zone_file
+    data['owner_address'] = address
 
     return data
 
@@ -200,9 +314,7 @@ def get_profile(username, refresh=False, namespace=DEFAULT_NAMESPACE):
     if dht_cache_reply is None:
 
         try:
-            bs_client = Proxy(BLOCKSTACKD_IP, BLOCKSTACKD_PORT)
-            bs_resp = bs_client.get_name_blockchain_record(username + "." + namespace)
-            bs_resp = bs_resp[0]
+            bs_resp = get_name_blockchain_record(username + "." + namespace)
         except:
             abort(500, "Connection to blockstack-server %s:%s timed out" % (BLOCKSTACKD_IP, BLOCKSTACKD_PORT))
 
